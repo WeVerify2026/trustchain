@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OnePass for companies</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="wrap">
+    <nav class="nav ruled">
+      <a class="brand" href="/">OnePass</a>
+      <span class="badge push">For companies</span>
+      <a class="link current" href="/request">New request</a>
+    </nav>
+
+    <div class="two">
+      <form class="form" id="form">
+        <div class="field" style="gap:6px">
+          <h1>Request verified information</h1>
+          <p class="muted">Ask for exactly what you need. The person approves, and OnePass delivers it verified.</p>
+        </div>
+
+        <div class="field">
+          <label for="requester">Your company</label>
+          <input id="requester" type="text" value="Harbour Talent" required>
+          <div class="demo-switch" id="registration"></div>
+        </div>
+
+        <div class="field">
+          <label for="who">Who is this about?</label>
+          <input id="who" type="text" value="alex" list="people" autocomplete="off" required>
+          <datalist id="people"></datalist>
+          <span class="small muted" id="who-hint">Their OnePass ID. They will get a notification.</span>
+        </div>
+
+        <fieldset>
+          <legend>What do you need?</legend>
+          <div class="presets" id="presets"></div>
+          <div class="checks" id="checks"></div>
+        </fieldset>
+
+        <div class="field">
+          <label for="reason">Reason shown to the person</label>
+          <input id="reason" type="text" value="">
+        </div>
+
+        <label class="demo" for="impostor"><input type="checkbox" id="impostor"> Demo: send this as a scammer using the company's name</label>
+
+        <p class="error" id="error"></p>
+        <button type="submit" class="gold pill big" style="align-self:flex-start">Send request</button>
+      </form>
+
+      <div class="stack" id="result" style="gap:20px">
+        <div class="empty">The result appears here once the person approves your request.</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+  <script>
+    const result = document.getElementById("result");
+    const boxes = {};       // fact name -> its tick box
+    let timer;
+    let kept = null;        // the company's own copy of the result, once it has arrived
+
+    // ───────────── The form ─────────────
+    async function setup() {
+      const [{ users }, { fields, presets }] = await Promise.all([api("/api/users"), api("/api/catalog")]);
+
+      fill(document.getElementById("people"), users.map((u) => el("option", { value: u.id }, u.name)));
+      document.getElementById("who-hint").textContent =
+        "Their OnePass ID. They will get a notification. Demo IDs: " + users.map((u) => u.id).join(", ") + ".";
+
+      fill(document.getElementById("checks"), fields.map((field) => {
+        boxes[field] = el("input", { type: "checkbox", value: field });
+        return el("label", {}, boxes[field], label(field));
+      }));
+
+      // A shortcut ticks its usual set of facts and fills in a reason.
+      function choose(preset) {
+        for (const field of fields) boxes[field].checked = preset.fields.includes(field);
+        document.getElementById("reason").value = preset.reason;
+      }
+      fill(document.getElementById("presets"), presets.map((p) =>
+        el("button", { type: "button", class: "pill", onclick: () => choose(p) }, p.name)));
+      choose(presets[presets.length - 1]);
+    }
+
+    // DEMO: the registry admin's switch. Puts Harbour Talent on the registry of
+    // companies or takes it off, so both cases can be shown: a verified company
+    // and an unverified one. On Stellar this is a real transaction.
+    async function registration(change) {
+      const box = document.getElementById("registration");
+      let c;
+      try {
+        if (change !== undefined) {
+          fill(box, el("span", { class: "waiting small" }, el("span", { class: "dot" }), "Updating the registry…"));
+          c = await api("/api/demo/company", { registered: change });
+        } else {
+          c = await api("/api/demo/company");
+        }
+      } catch (e) {
+        fill(box, el("span", { class: "small bad" }, e.message),
+          el("button", { type: "button", class: "pill", onclick: () => registration() }, "Try again"));
+        return;
+      }
+      const where = c.on_stellar ? "the Stellar registry" : "the registry";
+      fill(box,
+        el("span", { class: "tag " + (c.registered ? "ok" : "bad") }, c.registered ? "Registered company" : "Not registered"),
+        el("span", { class: "small muted grow" },
+          c.name + (c.registered ? " is on " + where + ". Its requests arrive as verified."
+                                 : " is not on " + where + ". Its requests arrive as unverified.")),
+        el("button", { type: "button", class: "pill", onclick: () => registration(!c.registered) },
+          c.registered ? "Demo: remove from registry" : "Demo: add to registry"));
+    }
+    registration();
+
+    document.getElementById("form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.getElementById("error");
+      error.textContent = "";
+      try {
+        const { id } = await api("/api/requests", {
+          requester: document.getElementById("requester").value,
+          user: document.getElementById("who").value,
+          fields: Object.values(boxes).filter((b) => b.checked).map((b) => b.value),
+          reason: document.getElementById("reason").value,
+          impostor: document.getElementById("impostor").checked,
+        });
+        watch(id);
+      } catch (e) { error.textContent = e.message; }
+    });
+
+    // ───────────── The result ─────────────
+    const step = (text, state) => el("span", { class: state }, text);
+    const bar = () => el("span", { class: "bar", "aria-hidden": "true" });
+
+    function progress(r) {
+      const first = r.user_name.split(" ")[0];
+      const middle = {
+        pending: step("Waiting for " + first + "…", ""),
+        denied: step("Denied by " + first, "failed"),
+        refused: step("Approved by " + first, "done"),
+        verified: step("Approved by " + first, "done"),
+        rejected: step("Approved by " + first, "done"),
+      }[r.status];
+      const last = {
+        pending: step("Verified", ""),
+        denied: step("Nothing shared", ""),
+        refused: step("OnePass could not verify", "failed"),
+        verified: step("Verified", "done"),
+        rejected: step("Check failed", "failed"),
+      }[r.status];
+      return el("div", { class: "progress" }, step("Sent", "done"), bar(), middle, bar(), last);
+    }
+
+    function receiptLine(receipt) {
+      if (!receipt) return null;
+      const short = receipt.fingerprint.slice(0, 16) + "…";
+      if (receipt.status === "pending") return el("div", { class: "pair" },
+        el("span", { class: "k" }, "Receipt"), el("span", { class: "waiting small" }, el("span", { class: "dot" }), "Recording on Stellar…"));
+      if (receipt.status === "recorded") return el("div", { class: "pair" },
+        el("span", { class: "k" }, "Receipt recorded"), el("span", { class: "mono" }, short));
+      return el("div", { class: "pair" },
+        el("span", { class: "k" }, "Receipt"), el("span", { class: "small muted", style: "text-align:right" }, "Not recorded. " + (receipt.detail || "")));
+    }
+
+    function render(r) {
+      const parts = [progress(r)];
+
+      if (r.status === "pending") {
+        parts.push(el("div", { class: "card" },
+          el("div", { class: "waiting" }, el("span", { class: "dot" }), el("strong", {}, "Request sent to " + r.user_name)),
+          el("p", { class: "muted" }, "Asked for: " + r.wants.map(label).join(", ") + "."),
+          el("p", { class: "small muted" }, "They approve it on their OnePass page: ",
+            el("a", { href: "/app?user=" + r.user, target: "_blank", rel: "noreferrer" }, "open it in a new tab"), ".")));
+      } else if (r.status === "denied") {
+        parts.push(el("div", { class: "card" }, el("h2", {}, r.user_name + " declined"), el("p", { class: "muted" }, "Nothing was fetched or shared.")));
+      } else if (r.status === "refused") {
+        parts.push(el("div", { class: "card" }, el("h2", {}, "OnePass could not verify this"),
+          el("p", { class: "muted" }, "The information could not be confirmed against a trusted institution, so nothing was shared.")));
+      } else {
+        const v = r.verdict;
+        const keyOk = v.checks.some((c) => c.signer_is_onepass);
+        parts.push(
+          el("div", { class: "card", style: "gap:6px" },
+            el("div", { class: "head", style: "padding-bottom:12px" },
+              el("h2", { style: "font-size:20px" }, r.user_name),
+              v.ok ? el("span", { class: "stamp" }, "Verified by OnePass") : el("span", { class: "stamp bad" }, "Check failed")),
+            v.checks.map((c) => el("div", { class: "pair" },
+              el("span", { class: "k" }, label(c.field)),
+              el("span", { class: "v" },
+                c.received ? show(c.value) : "Not shared",
+                c.received && !c.ok && el("div", { class: "small bad", style: "font-weight:500" }, whyFailed(c))))),
+            r.expires_at && el("p", { class: "small muted", style: "padding-top:12px;border-top:1px solid var(--line)" },
+              "Issued to " + r.requester + " only, for this request. Valid until " + clock(r.expires_at) + "."),
+            el("p", { class: "small muted" },
+              "Sources are not disclosed. OnePass checked each one against the Stellar registry of trusted institutions before vouching for it.")),
+          el("div", { class: "card", style: "gap:0;background:transparent" },
+            el("span", { class: "eyebrow", style: "padding-bottom:10px" }, "Proof on Stellar"),
+            el("div", { class: "pair" }, el("span", { class: "k" }, "OnePass signing key"),
+              el("span", { class: "v " + (keyOk ? "ok" : "bad") }, keyOk ? "On the registry" : "Not found on the registry")),
+            receiptLine(r.receipt),
+            el("div", { class: "pair" }, el("span", { class: "k" }, "OnePass's copy of these facts"),
+              r.purged ? el("span", { class: "v ok" }, "Deleted")
+                       : el("span", { class: "waiting small" }, el("span", { class: "dot" }), "Deleted 30 seconds after delivery")),
+            el("div", { class: "pair" }, el("span", { class: "k" }, "Registry"),
+              el("span", { class: "small", style: "text-align:right" },
+                v.registry_url ? el("a", { href: v.registry_url, target: "_blank", rel: "noreferrer" }, "View the contract on Stellar") : v.registry))));
+        if (v.ok) parts.push(replayBox(r));
+      }
+      fill(result, parts);
+    }
+
+    const clock = (seconds) => new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+    // In plain words, why a stamped fact failed the company's check.
+    function whyFailed(c) {
+      if (!c.signature_ok) return "Altered after OnePass stamped it";
+      if (!c.signer_is_onepass) return "Signed by a key that is not OnePass's";
+      if (!c.issued_to_me) return "Issued to a different company";
+      if (!c.in_date) return "Expired";
+      return "";
+    }
+
+    // DEMO: can a company pass its verified result on to someone else?
+    // "Northgate Rentals" receives the same stamps and runs the same checks.
+    function replayBox(r) {
+      const other = "Northgate Rentals";
+      const out = el("div", {});
+      const button = el("button", { type: "button", onclick: async () => {
+        try {
+          const v = await api("/api/replay", { stamps: r.delivered, as_company: other });
+          fill(out,
+            el("p", { class: v.ok ? "ok" : "bad", style: "font-weight:600;margin-top:12px" },
+              v.ok ? other + " accepted it." : other + " rejected it."),
+            v.checks.map((c) => el("div", { class: "pair" },
+              el("span", { class: "k" }, label(c.field)),
+              el("span", { class: "small " + (c.ok ? "ok" : "bad"), style: "text-align:right" }, c.ok ? "Accepted" : whyFailed(c)))),
+            el("p", { class: "small muted", style: "margin-top:10px" },
+              "The signatures are genuine, but each stamp names " + r.requester + " and this request, so nobody else can use it."));
+        } catch (e) { fill(out, el("p", { class: "error" }, e.message)); }
+      } }, "Forward this result to " + other);
+      return el("div", { class: "card", style: "gap:10px;background:transparent" },
+        el("span", { class: "eyebrow" }, "Demo: can this result be passed on?"),
+        el("p", { class: "small muted" }, "Suppose " + r.requester + " sends these verified facts to another company."),
+        el("div", {}, button),
+        out);
+    }
+
+    // Keep checking until the request is answered and its receipt is settled.
+    async function watch(id) {
+      clearTimeout(timer);
+      let r;
+      try { r = await api("/api/requests/" + id); } catch { return; }
+
+      // Once OnePass has wiped its copy, the company still has its own: keep
+      // showing that, and only update what changed (the receipt, the wipe).
+      if (r.purged && kept && kept.id === r.id) {
+        kept.purged = true;
+        kept.receipt = r.receipt;
+      } else {
+        kept = r;
+      }
+      render(kept);
+
+      const delivered = r.status === "verified" || r.status === "rejected";
+      const unsettled = r.status === "pending"
+        || (r.receipt && r.receipt.status === "pending")
+        || (delivered && !r.purged);
+      if (unsettled) timer = setTimeout(() => watch(id), 1500);
+    }
+
+    setup();
+  </script>
+</body>
+</html>
